@@ -17,6 +17,11 @@ websites=("https://photonsec.com.au" "https://www.google.com")  # List of websit
 local success_count=0; local max_success=1;   # Maximum number of successful web connections to stop after webconn_checks() & Counter for successful web connections for webconn_checks()
 local fail_count=0; local max_fail=4          # Counter for failed web connections for webconn_checks(), It'll stop checking after the first 10 websites
 local curltimeout=3   # Number of seconds after which cURL will give up connecting for check_website()
+local proxy_variables=(
+  ALL_PROXY all_proxy ALL_proxy
+  HTTP_PROXY http_proxy HTTP_proxy
+  HTTPS_PROXY https_proxy HTTPS_proxy
+)
 
 
 ################################ FUNCTIONS #############################
@@ -49,7 +54,9 @@ check_website() {
     url=$1
     logI "  Checking connection to $url"
     start_spinner "Please wait..."
-    if curl -skI --connect-timeout $curltimeout --max-time $curltimeout "$url" | grep -E "HTTP/2 200|HTTP/1.1 200" > /dev/null; then
+    # -q ignores curl config files, while --proxy '' and --noproxy '*'
+    # explicitly prevent environment or application-level proxy use.
+    if curl -q -skI --proxy '' --noproxy '*' --connect-timeout $curltimeout --max-time $curltimeout "$url" | grep -E "HTTP/2 200|HTTP/1.1 200" > /dev/null; then
         echo -en "\r\033[2K\033[F\033[2K"
         #echo -en "\r\033[2K\033[F\033[2K\033[F\033[2K"
         stop_spinner; logI "  Direct connection ${GREEN}succeeded${NC}: $url"
@@ -96,11 +103,13 @@ exit_if_standalone () {
 
 ################################ RUNTIME #############################
 
-unset {ALL,all,HTTP,http,HTTPS,https}_proxy  # We need to start clean... no proxy settings!
+for proxy_variable in "${proxy_variables[@]}"; do
+  unset "$proxy_variable"
+done
 
 echo; logI "  ---   ${PINK}SCRIPT: $current_dir/$scriptname${NC}   ---"
 logI "        ${PINK}     It is intended to check if connection can be established without proxy${NC}"
-logI "Proxy environment variables have been unset."
+logI "Proxy environment variables have been unset for this process."
 
 # Execute the function to check webconnectivity
 webconn_checks
@@ -120,7 +129,8 @@ if [[ $fail_count -ge 2 ]]; then
   fi
 
 else
-  logI "We were able to connect directly to most websites, we are probably not be behind a proxy..."
+  logI "cURL connected without an explicit application proxy to most websites."
+  logI "This does not rule out transparent network proxying or TLS inspection."
   logI "If you believe this is wrong, please add some known proxied websites to ./websites.config"
   exit_if_standalone  # Exit only if standalone exec, otherwise moving on...
   logI "We will now test web requests and whether these are SSL intercepted or not..."

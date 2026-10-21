@@ -23,6 +23,7 @@ local scriptname=$(basename $(realpath $0))
 local current_dir=$(dirname $(realpath $0))
 variables=("REQUESTS_CA_BUNDLE" "SSL_CERT_FILE")
 extravarfile="$current_dir/ssl_vars.config"
+exclusion_file="$current_dir/ca_exclusions.conf"
 
 # If not invoked/sourced by another script, we'll set some variable for standalone use otherwise this would be ineritated by the source script along with $teefile...
 if [[ -z ${BLUEW-} ]]; then source "$current_dir/../lib/stderr_stdout_syntax.sh"; fi
@@ -50,6 +51,7 @@ help() {
     echo -e "Author:  contact@photonsec.com.au\t\tgithub.com/Enelass\nRuntime: currently running as $(whoami)\nVervion: $version\n"
     echo -e "Usage: $@ [OPTION]..."
     echo -e "  --help, -h\tDisplay this help menu..."
+    echo -e "  --download, -d\tBuild the validated PEM bundle without changing shell variables"
     echo -e "  --uninstall\tRemove the environement variables from Shell config file and remove downloaded files and backups"
     echo -e "  By default, if no switches are specified, it will run standone with verbose information"
     exit 0
@@ -102,61 +104,132 @@ uninstall(){
 	if [[ -z ${overwrite-} ]]; then exit 0 ; fi
 }
 
-# Function to add the internal Root CAs from the OS Keychain Manager to the certificate stores (cacert.pem)
+# Add only the internal roots already approved by Keychain_InternalCAs.sh.
 trustca() {
-	cacert="$1"		# $1 is the pem files to be patched... where $2 is the name of the application requiring it
-	if [ ! -f "$cacert" ]; then
-	  logW "    Custom Certificate Store could not be located at "$cacert"..."
-	  logE "    It will not be patched. Error was reported in the logfile"
-	else
-	  logI "    It will be patched with Internal Root CAs from the MacOS Keychain Access:"
-	  # Adds .bak extension to back it up the pem file everytime we patch it...
-	  cacertbackup=$cacert.$(date '+%F_%H%M%S').bak
-	  cp $cacert $cacertbackup	# Make a(n) (extra) backup
-	  # If we have more than five dated backup, erase the oldest (we don't want a evergrowing list of backup files)
-	  cd "$(dirname $cacert)"
-	  ls -t $(basename $cacert).*.bak | tail -n +5 | xargs rm 
-	  
+	local cacert="$1" certname cert_file fingerprint exported_cert
+	local -A bundle_fingerprints
+	local added=0
 
-	  # Go through each internal Root signing CA in Keychain Access one at a time to add the certificate or skip it
-	  # (skip if duplicates are found, since the certificate was already added)
-	  while read -r line; do # Use cut to extract the base 64 CA certifacte from the line
-	    certname=$(echo $line | cut -d\" -f2) # Extract cert names
-	    b64cert=$(security find-certificate -c $certname -p) # Find the matched cert
-	    line4=$(echo $b64cert | awk 'NR==4{print $0}') # Extract third line of cert for pattern matching (line 4 of whole cert, low risk of crypto collision)
-	    if ! grep -q $line4 $cacert; then 
-	      echo -e "\n# Internal Signing Root CA: $certname" >> $cacert
-	      echo $b64cert >> $cacert # If line4 isn't found in cert then append it to cacert.pem
-	        if [ $? -ne 0 ]; then # Error function to abort if copying is unsuccessful
-	          logW "         Something went wrong when trying to copy $certname into $cacert!"
-	          logI "         Restoring Original cacert.pem file..."
-	          cp $cacertbackup $cacert # Error function to abort if copying backup of cert is unsuccessful
-	          if [ $? -ne 0 ]; then logE " Restore Unsuccessfull. Aborting!"; fi
-	          exit 1
-	        fi
-	       logS "       ${BLUEW}$certname${NC} is now trusted in our custom certificate store"
-	    else logI "       ${BLUEW}$certname${NC} was already trusted in our custom certificate store"
-	    fi
-	  done <<< "$CAList"
-	  log "Success - Custom Certificate Store now includes our internal Root CAs"
+	if [[ ! -f "$cacert" ]]; then
+		logW "    Custom certificate store could not be located at '$cacert'."
+		return 1
 	fi
+
+	# Exact fingerprints replace the former partial-base64 duplicate check.
+	local split_dir=$(mktemp -d "${TMPDIR:-/tmp}/pem-var-roots.XXXXXX") || return 1
+	awk -v dir="$split_dir" '
+		/-----BEGIN CERTIFICATE-----/ { in_cert=1; count++; file=sprintf("%s/cert_%06d.pem", dir, count) }
+		in_cert { print > file }
+		/-----END CERTIFICATE-----/ && in_cert { close(file); in_cert=0 }
+	' "$cacert"
+	for cert_file in "$split_dir"/cert_*.pem(N); do
+		fingerprint=$(openssl x509 -in "$cert_file" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' | tr -d ':[:space:]')
+		[[ -n "$fingerprint" ]] && bundle_fingerprints[$fingerprint]=1
+	done
+	rm -rf "$split_dir"
+
+	logI "    Adding currently trusted internal root CAs from macOS Keychain Access:"
+	while IFS= read -r certname; do
+		[[ -z "$certname" ]] && continue
+		exported_cert=$(mktemp "${TMPDIR:-/tmp}/internal-root.pem.XXXXXX") || return 1
+		if ! security find-certificate -c "$certname" -p > "$exported_cert" 2>/dev/null \
+			|| ! openssl x509 -in "$exported_cert" -noout >/dev/null 2>&1; then
+			logW "       Unable to export '$certname'; skipping it."
+			rm -f "$exported_cert"
+			continue
+		fi
+		fingerprint=$(openssl x509 -in "$exported_cert" -noout -fingerprint -sha256 2>/dev/null | sed 's/^.*=//' | tr -d ':[:space:]')
+		if [[ -n "${bundle_fingerprints[$fingerprint]-}" ]]; then
+			logI "       ${BLUEW}$certname${NC} is already present."
+		else
+			print >> "$cacert"
+			cat "$exported_cert" >> "$cacert" || { rm -f "$exported_cert"; return 1; }
+			bundle_fingerprints[$fingerprint]=1
+			added=$((added + 1))
+			logS "       Added ${BLUEW}$certname${NC}."
+		fi
+		rm -f "$exported_cert"
+	done <<< "$CAList"
+	logI "    Added $added internal root CA(s); the completed bundle will now be validated."
 }
 
 shell_var(){
 	log "Info    -    Looking for CA related Environment Variables in Shell Config $CONFIG_FILE"
+	local -A checked_pem_files
+	local shell_validation_status=0
+	checked_pem_files=()
+
+	configured_pem_path() {
+		local assignment="$1"
+		local pem_path="${assignment#*=}"
+		pem_path=$(print -r -- "$pem_path" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+
+		# Strip one matching pair of quotes without evaluating shell code from the
+		# user's configuration file.
+		if [[ "$pem_path" == \"*\" || "$pem_path" == \'*\' ]]; then
+			pem_path="${pem_path#?}"
+			pem_path="${pem_path%?}"
+		fi
+
+		case "$pem_path" in
+			'~/'*) pem_path="$HOME_DIR/${pem_path:2}" ;;
+			'$HOME/'*) pem_path="$HOME_DIR/${pem_path:6}" ;;
+			'${HOME}/'*) pem_path="$HOME_DIR/${pem_path:8}" ;;
+		esac
+		print -r -- "$pem_path"
+	}
+
+	validate_configured_pem() {
+		local configured_pem="$1"
+		local validation_status
+
+		if [[ "$configured_pem" == "$customcacert" ]]; then
+			if (( ! ${+checked_pem_files[$configured_pem]} )); then
+				logS "         Referenced PEM '$configured_pem' was rebuilt and validated during this run."
+				checked_pem_files[$configured_pem]=0
+			fi
+			return 0
+		fi
+		if [[ -z "$configured_pem" ]]; then
+			logW "         The assignment has an empty PEM path; it could not be validated."
+			return 1
+		fi
+		if [[ ! -r "$configured_pem" ]]; then
+			logW "         Referenced PEM '$configured_pem' is not readable; it could not be validated."
+			return 1
+		fi
+		if (( ${+checked_pem_files[$configured_pem]} )); then
+			return "${checked_pem_files[$configured_pem]}"
+		fi
+
+		logI "         Validating referenced PEM '$configured_pem'."
+		source "$current_dir/PEM_Check.sh" --quiet --cafile "$configured_pem" \
+			--exclusions "$exclusion_file"
+		validation_status=$?
+		checked_pem_files[$configured_pem]=$validation_status
+		if (( validation_status == 0 )); then
+			logS "         Referenced PEM '$configured_pem' is valid."
+		else
+			logW "         Referenced PEM '$configured_pem' failed validation."
+		fi
+		return "$validation_status"
+	}
+
 	# Function to check if a file contains a specific variable
 	contains_variable() {
-	  local variable=$1
-	  if grep -q "^export $variable=" "$CONFIG_FILE"; then
-	    logW "      ${GREENW}$variable${NC} was already set in in the user's Shell Config file"
-	    logI "          $(cat "$CONFIG_FILE" | grep "$variable")"
-	    logI "          If this entry is incorrect, please correct it manually with a text editor..."
+	  local variable=$1 assignment configured_pem
+	  assignment=$(grep -E "^[[:space:]]*export[[:space:]]+${variable}=" "$CONFIG_FILE" | tail -n 1)
+	  if [[ -n "$assignment" ]]; then
+	    logW "      ${GREENW}$variable${NC} was already set in the user's Shell Config file"
+	    logI "          $assignment"
+	    configured_pem=$(configured_pem_path "$assignment")
+	    validate_configured_pem "$configured_pem"
 	  else
 	    if [[ -z ${overwrite-} ]]; then logI "      Adding ${GREENW}$variable${NC} was not set in $CONFIG_FILE. Let's add it..." ; fi
- 		echo "export "$variable"=\""$customcacert"\"" >> $CONFIG_FILE
+		print -r -- "export ${variable}=\"${customcacert}\"" >> "$CONFIG_FILE"
  		# Check again, if we were able to add the variable
- 		if grep -q "^export $variable=" "$CONFIG_FILE"; then
-		    logS "         export ${GREENW}$variable${NC}=\""$customcacert"\" has been added to the Shell config file..." 
+		if grep -qE "^[[:space:]]*export[[:space:]]+${variable}=" "$CONFIG_FILE"; then
+		    logS "         export ${GREENW}$variable${NC}=\"$customcacert\" has been added to the Shell config file..."
 	    else
 	    	logE "         $variable could not be added to $CONFIG_FILE! Aborting..."
 	    fi
@@ -165,35 +238,57 @@ shell_var(){
 
 	# Iterate over each variable and check
 	for var in "${variables[@]}"; do
-	  contains_variable "$var"
+	  contains_variable "$var" || shell_validation_status=1
 	done
+	return "$shell_validation_status"
 }
 
 # Download the latest cacert.pem from curl.se (It contains an updated list of Public Root CAs)
 cacert_download() {
 	if [[ -z ${HOME_DIR-} ]]; then source "$current_dir/../lib/user_config.sh"; fi
 	customcacert="$HOME_DIR/.config/cacert/cacert.pem"
-	logI " Downloading and/or locating custom PEM certificate" 
-	# Create the directory for storing cacert.pem unless existing
-	if [[ -d "$HOME_DIR/.config/cacert/" ]]; then
-	else
-		mkdir -p "$HOME_DIR/.config/cacert/"
+	local target_dir=$(dirname "$customcacert")
+	mkdir -p "$target_dir" || return 1
+	build_dir=$(mktemp -d "$target_dir/.cacert-build.XXXXXX") || return 1
+	public_candidate="$build_dir/public.pem"
+	custom_candidate="$build_dir/cacert.pem"
+
+	logI " Downloading the current Mozilla root CA bundle from $cacertURL"
+	local attempt download_ok=0
+	for attempt in 1 2 3; do
+		if curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+			--output "$public_candidate" "$cacertURL"; then
+			download_ok=1
+			break
+		fi
+		logW "    Download failed on attempt $attempt."
+	done
+	if (( ! download_ok )); then
+		rm -rf "$build_dir"
+		logW "    The fresh CA bundle could not be downloaded; the existing bundle was left unchanged."
+		return 1
 	fi
 
-	# check if cacert.pem already exists...
+	# The downloaded file is the authoritative public trust input. The completed
+	# public + internal bundle is validated once, immediately before publication.
+	cp "$public_candidate" "$custom_candidate" || { rm -rf "$build_dir"; return 1; }
+}
+
+publish_cacert() {
+	local backup
 	if [[ -f "$customcacert" ]]; then
-		logW "    Custom PEM certificate exists already. It will not be retrieved from the internet..."
-	else
-		cd $(dirname "$customcacert")
-		for i in {1..3}; do curl -k -L -O "$cacertURL" >/dev/null 2>&1 && break || logW "    Download failed on attempt $i"; done	
-		if [[ ! -f "$customcacert" ]]; then
-			logW "    Something went wrong with downloading cacert.pem from "$cacertURL"..."
-			logE "    Please troubleshoot the issue or contact support. Aborting!"
-		fi
+		backup="$customcacert.$(date '+%F_%H%M%S').bak"
+		cp -p "$customcacert" "$backup" || return 1
+		# Retain the five newest recoverable backups.
+		local -a backups
+		backups=("$customcacert".*.bak(Nom))
+		(( ${#backups[@]} > 5 )) && rm -f -- "${backups[@]:5}"
 	fi
-	logI "    Custom PEM certificate can be found at "$customcacert""
-	 # We keep a vanilla cacert.pem as we'll use it to determine if a website isn't signed by a public CA
-	 if [[ ! -f $customcacert.public ]]; then cp -f $customcacert "$customcacert.public"; fi
+
+	mv -f "$public_candidate" "$customcacert.public" || return 1
+	mv -f "$custom_candidate" "$customcacert" || return 1
+	rmdir "$build_dir" 2>/dev/null || true
+	logS "    Published a fresh validated certificate store at '$customcacert'."
 }
 
 ###########################   Script Switches and Runtime   ###########################
@@ -206,7 +301,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --help|-h) help ;;								
     --uninstall|-u) uninstall ;;					# Wipe everything this script did: custom certificate store (cacert.pem) and restore original ~/.zshrc (pre-reuntime of this script)
-	--download|-d) cacert_download ;;				# It will download and build a custom certificate store (cacert.pem), but won't touch the Env variables in user's Shell Config 
+	--download|-d) download_only=1 ;;				# Build the custom certificate store without touching shell variables.
 	--daemon|-D) daemon ;;							# It will create a LaunchAgent in User Directory to periodically update the Custom Certificate so it remains up to date...
 	--overwrite|-o) overwrite=true ; uninstall ;;	# It will force rewrite the cacert.pem + Env variables in user's Shell Config 
    *) ;;
@@ -222,17 +317,26 @@ logI "        ${PINK}     It will then create environment variable in the user s
 
 
 source "$current_dir/../lib/user_config.sh" --quiet	# Let's identify the logged-in user, it's home directory, it's default Shell interpreter and associated config file...
-cacert_download	# Let's download cacert.pem 
-
-# Check if the certificate authority file is valid
-source "$current_dir/PEM_Check.sh" --cafile "$customcacert"
+cacert_download || logE "Unable to prepare a fresh public root CA bundle."
 
 # List the Internal Root CAs and patch cacert.pem with internal Root CAs
 source "$current_dir/Keychain_InternalCAs.sh" --silent		# This command will invoke the script and return variable $CAList which lists the names of Internal Signing Root CAs from the Keychain Access in MacOS
-trustca "$customcacert"
+trustca "$custom_candidate" || { rm -rf "$build_dir"; logE "Unable to add internal root CAs."; }
+
+# Validate the complete bundle against macOS Keychain trust and the local
+# exclusion policy. The downloaded Mozilla bundle is input, not a trust override.
+source "$current_dir/PEM_Check.sh" --quiet --cafile "$custom_candidate" \
+	--exclusions "$exclusion_file"
+if (( $? != 0 )); then
+	rm -rf "$build_dir"
+	logE "The completed certificate store failed validation."
+fi
+publish_cacert || { rm -rf "$build_dir"; logE "Unable to publish the validated certificate store."; }
 
 # Let's inspect the file for existing environement variables & Let's reference this cacert.pem in the Shell Interpreter config file
-shell_var
+if [[ -z "${download_only-}" ]]; then
+	shell_var || logE "One or more PEM files referenced by shell variables failed validation."
+fi
 
-source "$CONFIG_FILE"
-cd "$script_dir"
+if [[ -z "${download_only-}" ]]; then source "$CONFIG_FILE"; fi
+[[ -n "${script_dir-}" ]] && cd "$script_dir"

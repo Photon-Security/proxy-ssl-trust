@@ -158,7 +158,7 @@ install_alpaca() {
       	logW "       We failed installing Alpaca...."
       	logI "          We'll try installing one more time, but without proxy settings..."
       	failed_install=true
-      	unset {all,http,https,ALL,HTTP,HTTPS}_proxy
+		unset ALL_PROXY all_proxy ALL_proxy HTTP_PROXY http_proxy HTTP_proxy HTTPS_PROXY https_proxy HTTPS_proxy
       	install_alpaca
       else
       	logE "We failed installing Alpaca, please install it manually as per: https://github.com/samuong/alpaca"
@@ -166,19 +166,27 @@ install_alpaca() {
     fi
 }
 
-# Function to verify if Alpaca is installed and installed with brew
+# Detect Alpaca independently from its installation method. Homebrew ownership
+# is useful for service management, but is not required when another package
+# manager or an administrator already supplied a working daemon.
 is_brew_alpaca(){
-	logI "   ${GREEN}Install - ${NC}Is Alpaca installed with Homebrew ? (We need it to set it as a Daemon)"
-	if $(brew list Alpaca > /dev/null 2>&1) ; then
-		logS "       $(alpaca --version) is already installed by Homebrew in $(dirname $(which alpaca))..."
-	else 
-		if ! command -v alpaca > /dev/null 2>&1; then		# If Alpaca is not installed at all...
-			logI "       Alpaca is not installed..."
-		else												# If Alpaca is not installed with Homebrew...
-			logW "       $(alpaca --version) is installed but not with Homebrew..."
-			logI "       We'll need to install it so we can enable auto-start (daemon/service)"
-		fi
+	local alpaca_path
+	logI "   ${GREEN}Install - ${NC}Is Alpaca installed?"
+
+	if ! alpaca_path=$(command -v alpaca 2>/dev/null); then
+		logI "       Alpaca is not installed."
 		install_alpaca
+		alpaca_path=$(command -v alpaca 2>/dev/null) || return 1
+	fi
+
+	alpaca_installed=true
+	if command -v brew >/dev/null 2>&1 && brew list --formula alpaca >/dev/null 2>&1; then
+		brew_managed_alpaca=true
+		logS "       $(alpaca --version) is installed by Homebrew at '$alpaca_path'."
+	else
+		unset brew_managed_alpaca
+		logW "       $(alpaca --version) is installed at '$alpaca_path', but is not managed by Homebrew."
+		logI "       Continuing with the existing installation; Homebrew service management will be skipped."
 	fi
 }
 
@@ -226,6 +234,23 @@ alpaca_listening() {
 # Function to start Alpaca as a serice/daemon (auto-start with the OS)
 alpaca_service() {
 	logI "   ${GREEN}Service - ${NC} Is Alpaca service started?"
+	if [[ -z ${brew_managed_alpaca-} ]]; then
+		local launchd_entry
+		launchd_entry=$(launchctl list 2>/dev/null | grep -i 'alpaca' | head -n 1)
+		if [[ -n ${alpaca3128-} ]]; then
+			alprunning=true
+			logS "       The existing Alpaca process is already listening on TCP 3128."
+		else
+			logW "       Alpaca is installed but is not currently listening on TCP 3128."
+		fi
+		if [[ -n "$launchd_entry" ]]; then
+			logI "       A launchd job is registered: $(print -r -- "$launchd_entry" | awk '{print $3}')"
+		else
+			logW "       Auto-start could not be confirmed because this installation is not managed by Homebrew."
+		fi
+		return 0
+	fi
+
 	start_spinner "Please wait, ${GREENW}brew services${NC} can occasionaly take a while..."
 	if ! brew services info alpaca | grep "PID:" > /dev/null 2>&1; then
 		stop_spinner
@@ -286,7 +311,7 @@ attempt_install() {
         logE "   Failed to install $package. Attempts left: $attempts"
         logI "   Let's try without proxy settings..."
         attempts=$((attempts - 1))
-        unset {all,http,https}_proxy
+       unset ALL_PROXY all_proxy ALL_proxy HTTP_PROXY http_proxy HTTP_proxy HTTPS_PROXY https_proxy HTTPS_proxy
     done
     logE "Failed to install $package after 3 attempts. Exiting..."
 }
@@ -340,10 +365,9 @@ is_socket_free
 #    If Alpaca is listning on another port than 3128, It will also error out...
 alpaca_listening
 
-# Check if Alpaca is installed with Homebrew...
-#    It will check if it's installed with Homebrew and if not, it'll call install_alpaca function to attempt installing it
-#	 It will error out, if Homebrew isn't available or if we can'n download and install Alpaca with brew
-is_brew_alpaca
+# Check whether Alpaca is installed. A non-Homebrew installation is accepted;
+# Homebrew is used only when Alpaca is absent or when managing its own service.
+is_brew_alpaca || logE "Alpaca is not installed and could not be installed."
 
 # Now that Alpaca is installed, we should be able to start the service. Let's try...
 #   If it fails starting it, it will error out, but before it'll try multiple times, and attempt a re-install if necessary

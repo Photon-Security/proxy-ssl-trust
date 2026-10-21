@@ -29,7 +29,6 @@ fi
 teefile="/tmp/$AppName.log"
 invoked=true	# Set this variable to instruct other scripts that we've invoked them if the variable is set
 if [[ -z ${BLUEW-} ]]; then
-    # source "$script_dir/lib/play.sh"
     source "$script_dir/lib/stderr_stdout_syntax.sh"
 fi
 ####################################### Defining functions ###########################
@@ -160,7 +159,7 @@ while [[ $# -gt 0 ]]; do
     --patch) patch ;;
     --patch_uninstall) patch_uninstall ;;
 		--proxy) proxy ;;
-		--proxy) proxy_uninstall ;;
+		--proxy_uninstall) proxy_uninstall ;;
     *) echo "${RED}Error:${NC} unknown option '$1'" >&2; exit 1 ;;
   esac
   shift
@@ -169,12 +168,9 @@ done
 
 ##################################### Runtime ######################################
 
-# Traps to kill subshells processes when this main script terminates (whether gracefully or not)
-trap 'stop_spinner_sigint; play_sigint > /dev/null 2>&1' SIGINT
-trap 'stop_spinner; play_exit > /dev/null 2>&1' EXIT
-
-# A bit of music never hurts...
-play
+# Traps to stop background progress indicators when the main script terminates.
+trap 'stop_spinner_sigint' SIGINT
+trap 'stop_spinner' EXIT
 
 clear
 logI "  ---   ${PINK}SCRIPT: $script_dir/$scriptname${NC}   ---"

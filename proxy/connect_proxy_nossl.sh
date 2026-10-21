@@ -82,7 +82,12 @@ if [[ -z ${HTTPS_PROXY-} || -z ${https_proxy-} ]]; then
   logW "Proxy settings were not set..."
 fi
 
-export {ALL,all,HTTP,http,HTTPS,https}_proxy="http://localhost:3128"
+export ALL_PROXY="http://localhost:3128"
+export all_proxy="http://localhost:3128"
+export HTTP_PROXY="http://localhost:3128"
+export http_proxy="http://localhost:3128"
+export HTTPS_PROXY="http://localhost:3128"
+export https_proxy="http://localhost:3128"
 logI "The following proxy variables have been set:"
 logI "    ${GREENW}http_proxy${NC}  is set to \"$http_proxy\"" 
 logI "    ${GREENW}https_proxy${NC} is set to \"$https_proxy\""

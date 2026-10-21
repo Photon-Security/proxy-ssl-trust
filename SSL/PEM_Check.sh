@@ -1,7 +1,11 @@
 #!/bin/zsh
-local scriptname=$(basename $(realpath $0))
-local current_dir=$(dirname $(realpath $0))
-local pem_error
+
+# Validate and, when authorised, clean a PEM root certificate bundle.
+
+local scriptname=$(basename "$(realpath "$0")")
+local current_dir=$(dirname "$(realpath "$0")")
+local standalone=1
+[[ "${ZSH_EVAL_CONTEXT-}" == *:file* || -n "${invoked-}" ]] && standalone=0
 
 if [[ -z "${BLUEW-}" ]]; then
     source "$current_dir/../lib/stderr_stdout_syntax.sh"
@@ -9,379 +13,360 @@ if [[ -z "${BLUEW-}" ]]; then
     teefile="/tmp/$AppName.log"
 fi
 
-# Help function
+local exclusion_file="$current_dir/ca_exclusions.conf"
+local audit_only=0
+local verbose=0
+local quiet=0
+local pem_file=""
+pem_error=false
+
 help() {
-  echo -e "Usage: $0 [options]
+    cat <<EOF
+Usage: $scriptname [OPTIONS] [PEM_FILE]
+
+Validate a PEM root CA bundle and identify certificates which are malformed,
+expired, not yet valid, not signing root CAs, duplicated, untrusted by macOS,
+or explicitly denied by the local CA exclusion policy.
+
 Options:
-    --help, -h           Show this help message and exit.
-    --quiet, -q          Suppress the output except for error status.
-    --verbose, -v        Shows the verbose for each certificate subject and name
-    --cafile, -c, -f     Path to the PEM file to inspect
- Description:
-    This script checks the integrity of PEM files containing certificates by parsing them and validating each certificate using OpenSSL.
-    It reads the provided PEM file, lists the certificates, and verifies each one. If any certificate is invalid, it logs an error.
-    The script displays a progress bar as it processes the certificates.
-    If no PEM file path is specified as an argument, the script prompts the user to input the path interactively.
- Example Usage:
-    $scriptname --cafile /path/to/certificate.pem   # Validates certificates in the specified PEM file.
-    $scriptname --verbose --cafile /path/to/crt.pem # Validates and displays certificate subjects from the specified PEM file
-    $scriptname -q -f /path/to/certificate.pem      # Validates certificates quietly and saves status in pem_error variable
-    $scriptname /path/to/certificate.pem            # Uses positional PEM path.
-    $scriptname                                     # Prompts for PEM file path interactively.
- Author:
-    contact@photonsec.com.au
-    github.com/Enelass"
-    exit 0
+  --cafile, -c, -f PATH       PEM bundle to inspect
+  --exclusions PATH           CA exclusion policy (default: $exclusion_file)
+  --audit                     Report issues without changing the PEM file
+  --verbose, -v               List retained certificate subjects
+  --quiet, -q                 Suppress progress and success messages
+  --help, -h                  Show this help
+
+When this script is executed directly, it explains every proposed removal and
+requires confirmation before changing the file. When sourced by the bundle
+builder, unsafe certificates are removed automatically.
+EOF
 }
 
-# Function to display a progress bar
-show_progress_bar() {
-  local current=$1
-  local total=$2
-  local bar_length=50
-  local progress=$((current * bar_length / total))
-  local remainder=$((bar_length - progress))
-  printf "\r["
-  printf "%${progress}s" | tr " " "="
-  printf "%${remainder}s] " " "
-  printf " %d/%d" "$current" "$total"
+normalise_hash() {
+    print -r -- "$1" | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]'
 }
 
-# Function to detect and remove duplicate PEM certificate blocks in-place
-dedupe_pem_file(){
-  local pem_file=$1
-  local tmp_file="${pem_file}.dedup.$$"
-  local -A seen_hashes=()
-  local -a pre_block=()
-  local -a current_block=()
-  local current_pem=""
-  local in_pem=0
-  local after_end=0
-  local line pem_hash duplicate_subject
-  local cert_index=0
+certificate_fingerprint() {
+    openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null \
+        | sed 's/^.*=//' | tr -d ':[:space:]' | tr '[:lower:]' '[:upper:]'
+}
 
-  duplicate_certs=""
+certificate_spki_hash() {
+    openssl x509 -in "$1" -pubkey -noout 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | openssl dgst -sha256 2>/dev/null \
+        | sed 's/^.*= //' | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'
+}
 
-  exec 3>"$tmp_file" || {
-    logE "Unable to create temporary file for deduplication: $tmp_file"
+certificate_name() {
+    local name
+    name=$(openssl x509 -in "$1" -noout -subject -nameopt RFC2253 2>/dev/null \
+        | sed 's/^subject=//')
+    [[ -n "$name" ]] && print -r -- "$name" || print -r -- "certificate #$2"
+}
+
+# Print the policy reason if a certificate is explicitly excluded.
+exclusion_reason() {
+    local cert_sha="$1" spki_sha="$2"
+    local kind value display reason normalised
+    [[ -r "$exclusion_file" ]] || return 1
+
+    while IFS='|' read -r kind value display reason || [[ -n "$kind$value$display$reason" ]]; do
+        [[ -z "$kind" || "$kind" == \#* ]] && continue
+        normalised=$(normalise_hash "$value")
+        case "$kind" in
+            cert_sha256)
+                [[ "$cert_sha" == "$normalised" ]] || continue
+                ;;
+            spki_sha256)
+                [[ "$spki_sha" == "$normalised" ]] || continue
+                ;;
+            *)
+                continue
+                ;;
+        esac
+        print -r -- "${reason:-Explicitly excluded by local policy}${display:+ ($display)}"
+        return 0
+    done < "$exclusion_file"
     return 1
-  }
+}
 
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    # If we just finished a PEM block, decide whether to include a trailing blank line
-    if (( after_end )); then
-      if [[ -z "$line" ]]; then
-        current_block+=("$line")
-        # finalize block with trailing blank
-      else
-        # finalize block without consuming this non-blank line
-        # (fall through to normal processing for this line)
-      fi
-
-      if (( ${#current_block[@]} > 0 )); then
-        pem_hash=$(printf '%s' "$current_pem" | openssl dgst -sha256 2>/dev/null | sed 's/^.*= //')
-        cert_index=$((cert_index + 1))
-        if [[ -n "$pem_hash" && -n ${seen_hashes[$pem_hash]-} ]]; then
-          duplicate_subject=$(printf '%s' "$current_pem" | openssl x509 -noout -subject 2>/dev/null | sed 's/^subject= *//')
-          duplicate_certs+="$cert_index (same as ${seen_hashes[$pem_hash]}) [$duplicate_subject]  "
-          logW "Removing duplicate certificate block #$cert_index (Subject: $duplicate_subject), duplicate of #${seen_hashes[$pem_hash]}"
-          # Do not write this block to output
-        else
-          seen_hashes[$pem_hash]=$cert_index
-          for l in "${current_block[@]}"; do
-            print -u3 -- "$l"
-          done
-        fi
-        current_block=()
-        current_pem=""
-      fi
-      after_end=0
-      # If we consumed the trailing blank line, continue to next line
-      if [[ -z "$line" ]]; then
-        continue
-      fi
-      # Otherwise fall through to process this non-blank line
+show_exclusion_policy() {
+    local kind value display reason normalised count=0
+    if [[ ! -r "$exclusion_file" ]]; then
+        logW "Local exclusion policy '$exclusion_file' is not readable."
+        return 1
     fi
 
-    # Inside a PEM certificate block
-    if (( in_pem )); then
-      current_block+=("$line")
-      current_pem+="$line"$'\n'
-      if [[ "$line" == *"-----END CERTIFICATE-----"* ]]; then
-        in_pem=0
-        after_end=1
-      fi
-      continue
-    fi
+    logI "Configured local CA exclusions:"
+    while IFS='|' read -r kind value display reason || [[ -n "$kind$value$display$reason" ]]; do
+        [[ -z "$kind" || "$kind" == \#* ]] && continue
+        [[ "$kind" == cert_sha256 || "$kind" == spki_sha256 ]] || continue
+        normalised=$(normalise_hash "$value")
+        count=$((count + 1))
+        logI "  $display [$kind: $normalised]"$'\n'"                            $reason"
+    done < "$exclusion_file"
+    (( count > 0 )) || logI "  (none)"
+}
 
-    # Not currently in a PEM block
-    if [[ "$line" == *"-----BEGIN CERTIFICATE-----"* ]]; then
-      current_block=()
-      # Attach any comment block immediately above
-      if (( ${#pre_block[@]} > 0 )); then
-        for l in "${pre_block[@]}"; do
-          current_block+=("$l")
-        done
-        pre_block=()
-      fi
-      current_block+=("$line")
-      current_pem="$line"$'\n'
-      in_pem=1
-      continue
-    fi
+macos_trusts_certificate() {
+    command -v security >/dev/null 2>&1 || return 127
+    # -L avoids fetching issuer material. Apple trust metadata and local
+    # Keychain trust settings are still consulted.
+    security verify-cert -c "$1" -l -L -q >/dev/null 2>&1
+}
 
-    # Handle blank lines outside PEM blocks
-    if [[ -z "$line" ]]; then
-      # A blank line breaks any pending comment block; flush comments then the blank
-      if (( ${#pre_block[@]} > 0 )); then
-        for l in "${pre_block[@]}"; do
-          print -u3 -- "$l"
-        done
-        pre_block=()
-      fi
-      print -u3 -- "$line"
-      continue
-    fi
+rewrite_bundle() {
+    local source_file="$1" temp_dir="$2" count="$3"
+    local replacement="${source_file}.clean.$$" index cert
 
-    # Handle comment lines that may belong to the next certificate
-    if [[ "$line" == \#* ]]; then
-      pre_block+=("$line")
-      continue
-    fi
+    : > "$replacement" || return 1
+    print -r -- "# Root CA bundle validated by $scriptname on $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$replacement"
+    print -r -- "# Exclusion policy: $exclusion_file" >> "$replacement"
 
-    # Any other non-comment, non-blank line: flush pending comments and write the line
-    if (( ${#pre_block[@]} > 0 )); then
-      for l in "${pre_block[@]}"; do
-        print -u3 -- "$l"
-      done
-      pre_block=()
-    fi
-    print -u3 -- "$line"
-  done <"$pem_file"
-
-  # Finalize a PEM block if file ended right after it
-  if (( after_end )) && (( ${#current_block[@]} > 0 )); then
-    pem_hash=$(printf '%s' "$current_pem" | openssl dgst -sha256 2>/dev/null | sed 's/^.*= //')
-    cert_index=$((cert_index + 1))
-    if [[ -n "$pem_hash" && -n ${seen_hashes[$pem_hash]-} ]]; then
-      duplicate_subject=$(printf '%s' "$current_pem" | openssl x509 -noout -subject 2>/dev/null | sed 's/^subject= *//')
-      duplicate_certs+="$cert_index (same as ${seen_hashes[$pem_hash]}) [$duplicate_subject]  "
-      logW "Removing duplicate certificate block #$cert_index (Subject: $duplicate_subject), duplicate of #${seen_hashes[$pem_hash]}"
-      # Do not write this block
-    else
-      seen_hashes[$pem_hash]=$cert_index
-      for l in "${current_block[@]}"; do
-        print -u3 -- "$l"
-      done
-    fi
-  fi
-
-  # Flush any remaining comment block at end of file
-  if (( ${#pre_block[@]} > 0 )); then
-    for l in "${pre_block[@]}"; do
-      print -u3 -- "$l"
+    for (( index=1; index<=count; index++ )); do
+        [[ -n "${remove_reasons[$index]-}" ]] && continue
+        cert=$(printf '%s/cert_%06d.pem' "$temp_dir" "$index")
+        print >> "$replacement"
+        cat "$cert" >> "$replacement" || {
+            rm -f "$replacement"
+            return 1
+        }
     done
-  fi
 
-  exec 3>&-
-
-  mv "$tmp_file" "$pem_file" || {
-    logE "Failed to replace original PEM file with deduplicated version."
-    return 1
-  }
-
-  if [[ -n ${duplicate_certs-} ]]; then
-    logI "Removed duplicate certificate blocks from PEM file."
-  fi
+    chmod --reference="$source_file" "$replacement" 2>/dev/null || chmod 0644 "$replacement"
+    mv -f "$replacement" "$source_file"
 }
 
-# Function to check the integrity of pem file and its embedded certificates
-pem_integrity_check(){
-  local pem_file=$1
-  local cert_count=0
-  local current_cert_index=0
-  local content current_cert=""
-  local -a certs=()
-  local certCN
-  local openssl_status
-  cert_CNs=""
+pem_integrity_check() {
+    local target="$1"
+    local temp_dir count_file count=0 begin_count end_count index cert
+    local name cert_sha spki_sha reason subject issuer constraints key_usage
+    local retained=0 trust_status policy_match_count=0
+    typeset -gA remove_reasons seen_fingerprints
+    remove_reasons=()
+    seen_fingerprints=()
+    cert_CNs=""
 
-  # Read entire pem file content
-  content=$(<"$pem_file")
+    temp_dir=$(mktemp -d "${TMPDIR:-/tmp}/pem-check.XXXXXX") || return 1
+    count_file="$temp_dir/count"
 
-  # Initialize array and temporary variable to store current certificate
-  current_cert_index=1
-  # Scan through each line of the file and construct certificates
-  while IFS= read -r line; do
-    current_cert+="$line"$'\n'
-    if [[ "$line" == *"-----END CERTIFICATE-----"* ]]; then
-      certs+=("$current_cert")
-      current_cert=""
-      cert_count=$((cert_count + 1))
+    begin_count=$(grep -c -- '-----BEGIN CERTIFICATE-----' "$target" 2>/dev/null)
+    end_count=$(grep -c -- '-----END CERTIFICATE-----' "$target" 2>/dev/null)
+    if grep -Eq -- '-----BEGIN (.*PRIVATE KEY|.*CERTIFICATE REQUEST)-----' "$target"; then
+        logW "Private keys or certificate requests were found in '$target'; the file was not changed."
+        rm -rf "$temp_dir"
+        pem_error=true
+        return 1
     fi
-  done <<< "$content"
+    if (( begin_count == 0 || begin_count != end_count )); then
+        logW "Certificate boundaries in '$target' are missing or unbalanced; the file was not changed."
+        rm -rf "$temp_dir"
+        pem_error=true
+        return 1
+    fi
 
-  logI "Processing certificates in \"$pem_file\". Please wait..."
-  logI "There are ${BLUEW}${cert_count} certificates${NC} in this certificate store"
+    awk -v dir="$temp_dir" '
+        /-----BEGIN CERTIFICATE-----/ {
+            if (in_cert) malformed=1
+            in_cert=1; count++
+            file=sprintf("%s/cert_%06d.pem", dir, count)
+        }
+        in_cert { print > file }
+        /-----END CERTIFICATE-----/ && in_cert { close(file); in_cert=0 }
+        END {
+            if (in_cert) malformed=1
+            print count+0 > (dir "/count")
+            exit malformed ? 2 : 0
+        }
+    ' "$target"
+    if (( $? != 0 )); then
+        logW "Nested or incomplete PEM certificate blocks were found; the file was not changed."
+        rm -rf "$temp_dir"
+        pem_error=true
+        return 1
+    fi
+    count=$(<"$count_file")
+    (( quiet )) || logI "Inspecting $count certificates in '$target'."
+    (( verbose )) && show_exclusion_policy
 
-  # Iterate over each certificate in the array and inspect it using OpenSSL
-  local idx=1
-  while (( idx <= cert_count )) && can_continue; do
-    local cert="${certs[idx]}"
-    current_cert_index=$idx
+    for (( index=1; index<=count; index++ )); do
+        cert=$(printf '%s/cert_%06d.pem' "$temp_dir" "$index")
+        name=$(certificate_name "$cert" "$index")
 
-    # Check for interrupt before processing this certificate
-    check_interrupted
+        if ! openssl x509 -in "$cert" -noout >/dev/null 2>&1; then
+            remove_reasons[$index]="Malformed certificate data"
+            continue
+        fi
 
-    # Verification of the certificate
+        cert_sha=$(certificate_fingerprint "$cert")
+        spki_sha=$(certificate_spki_hash "$cert")
+        if reason=$(exclusion_reason "$cert_sha" "$spki_sha"); then
+            policy_match_count=$((policy_match_count + 1))
+            remove_reasons[$index]="Explicitly distrusted/revoked by policy: $reason"
+            continue
+        fi
 
-    if [[ ${verbose:-0} -eq 1 ]]; then
-        certCN=$(
-          echo "$cert" | openssl x509 -text -noout 2>/dev/null \
-            | sed -n 's/.*CN=\([^,\/]*\).*/\1/p' \
-            | sort -u \
-            | xargs
-        )
-        openssl_status=$?
-        if [[ -z "$certCN" ]]; then
-          certCN=$(
-            echo "$cert" | openssl x509 -text -noout 2>/dev/null \
-              | grep "Subject: "
-          )
-          openssl_status=$?
+        if [[ -n "${seen_fingerprints[$cert_sha]-}" ]]; then
+            remove_reasons[$index]="Duplicate of certificate #${seen_fingerprints[$cert_sha]}"
+            continue
+        fi
+        seen_fingerprints[$cert_sha]=$index
+
+        if ! openssl x509 -in "$cert" -checkend 0 -noout >/dev/null 2>&1; then
+            remove_reasons[$index]="Expired at $(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
+            continue
+        fi
+
+        subject=$(openssl x509 -in "$cert" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//')
+        issuer=$(openssl x509 -in "$cert" -noout -issuer -nameopt RFC2253 2>/dev/null | sed 's/^issuer=//')
+        if [[ "$subject" != "$issuer" ]]; then
+            remove_reasons[$index]="Not a self-signed root CA"
+            continue
+        fi
+
+        constraints=$(openssl x509 -in "$cert" -noout -ext basicConstraints 2>/dev/null)
+        if [[ "$constraints" != *"CA:TRUE"* ]]; then
+            remove_reasons[$index]="Basic Constraints does not permit CA signing"
+            continue
+        fi
+
+        key_usage=$(openssl x509 -in "$cert" -noout -ext keyUsage 2>/dev/null)
+        if [[ -n "$key_usage" && "$key_usage" != *"Certificate Sign"* ]]; then
+            remove_reasons[$index]="Key Usage does not permit certificate signing"
+            continue
+        fi
+
+        # Verifying the root against itself checks its signature and validity,
+        # including a notBefore date in the future.
+        if ! openssl verify -check_ss_sig -CAfile "$cert" "$cert" >/dev/null 2>&1; then
+            remove_reasons[$index]="Self-signature is invalid or the certificate is not yet valid"
+            continue
+        fi
+
+        macos_trusts_certificate "$cert"
+        trust_status=$?
+        if (( trust_status == 127 )); then
+            remove_reasons[$index]="Trust cannot be established because the macOS security tool is unavailable"
+            continue
+        elif (( trust_status != 0 )); then
+            remove_reasons[$index]="Not trusted as a root CA by the current macOS Keychain trust settings"
+            continue
+        fi
+
+        retained=$((retained + 1))
+        (( verbose )) && cert_CNs+="$index) $name"$'\n'
+    done
+
+    if (( policy_match_count > 0 )); then
+        logW "Local exclusion policy '$exclusion_file' matched $policy_match_count certificate(s)."
+    elif (( verbose )); then
+        logI "No explicitly excluded certificates are present in '$target'."
+    fi
+
+    local -a removal_indexes
+    removal_indexes=(${(kon)remove_reasons})
+    if (( ${#removal_indexes[@]} > 0 )); then
+        pem_error=true
+        logW "The following certificates should be removed from '$target':"
+        for index in "${removal_indexes[@]}"; do
+            cert=$(printf '%s/cert_%06d.pem' "$temp_dir" "$index")
+            name=$(certificate_name "$cert" "$index")
+            logW "  #$index $name — ${remove_reasons[$index]}"
+        done
+
+        if (( retained == 0 )); then
+            logW "Removal would leave no trusted root CAs; the file was not changed."
+        elif (( audit_only )); then
+            logW "Audit mode is enabled; no certificates were removed."
+        elif (( standalone )); then
+            if [[ -t 0 ]]; then
+                local reply
+                print -n -- "Remove these ${#removal_indexes[@]} certificate(s) from the PEM file? [y/N] "
+                read -r reply
+                if [[ "$reply" == [yY] || "$reply" == [yY][eE][sS] ]]; then
+                    rewrite_bundle "$target" "$temp_dir" "$count" || {
+                        logW "Unable to replace '$target' with the cleaned bundle."
+                        rm -rf "$temp_dir"
+                        return 1
+                    }
+                    logS "Removed ${#removal_indexes[@]} unsafe certificate(s); $retained trusted root CA(s) remain."
+                    pem_error=false
+                else
+                    logW "No certificates were removed."
+                fi
+            else
+                logW "Confirmation requires an interactive terminal; no certificates were removed."
+            fi
+        else
+            rewrite_bundle "$target" "$temp_dir" "$count" || {
+                logW "Unable to replace '$target' with the cleaned bundle."
+                rm -rf "$temp_dir"
+                return 1
+            }
+            logI "Removed ${#removal_indexes[@]} unsafe certificate(s); $retained trusted root CA(s) remain."
+            pem_error=false
         fi
     else
-        echo "$cert" | openssl x509 -text -noout >/dev/null 2>&1
-        openssl_status=$?
+        pem_error=false
+        (( quiet )) || logS "Certificate store contains $retained valid, trusted root signing CA(s)."
     fi
 
-    if [[ $openssl_status -ne 0 ]]; then
-      pem_error=true
-      echo
-      logonly "Certificate number $current_cert_index is not valid..."
-      cert_error+="$current_cert_index) $certCN   "
-    fi
-    # echo "$current_cert_index )   $certCN"
-    if [[ ${verbose:-0} -eq 1 ]]; then
-        cert_CNs+="$current_cert_index) $certCN\n"
-    fi
-    
-    # Check for interrupt before showing progress bar
-    check_interrupted
-    show_progress_bar $current_cert_index $cert_count
-    current_cert_index=$((current_cert_index + 1))
-    idx=$((idx + 1))
-  done
-  echo -en "\r\033[2K\033[F\033[2K";  # Clear the previous line
+    (( verbose )) && print -r -- "$cert_CNs"
+    rm -rf "$temp_dir"
+    [[ "$pem_error" == false ]]
 }
 
-###########################   Script SWITCHES   ###########################
-while [[ "$#" -gt 0 ]]; do
+while (( $# > 0 )); do
     case "$1" in
-        --verbose|-v)
-            verbose=1
-            shift
-            ;;
-        --quiet|-q)
-            if [[ ${verbose:-0} -eq 1 ]]; then
-                logE "Quiet cannot be verbose..."
-                if [[ -n ${invoked-} ]]; then
-                    return 1
-                else
-                    exit 1
-                fi
-            fi
-            quiet
-            shift
-            ;;
-        --help|-h) clear ; help ;;
+        --verbose|-v) verbose=1; shift ;;
+        --quiet|-q) quiet=1; shift ;;
+        --audit) audit_only=1; shift ;;
+        --exclusions)
+            [[ $# -ge 2 ]] || { print -u2 -- "Missing value for $1"; return 2 2>/dev/null || exit 2; }
+            exclusion_file="$2"; shift 2 ;;
         --cafile|-c|-f)
-            pem_file="$2"
-            shift 2
-            ;;
-        -*|--*)
-            clear
-            logW "Invalid switch ${GREENW}$1${NC}. Refer to the usage instructions below."
+            [[ $# -ge 2 ]] || { print -u2 -- "Missing value for $1"; return 2 2>/dev/null || exit 2; }
+            pem_file="$2"; shift 2 ;;
+        --help|-h)
             help
+            if (( standalone )); then exit 0; else return 0; fi
+            ;;
+        --*)
+            print -u2 -- "Unknown option: $1"
+            help
+            if (( standalone )); then exit 2; else return 2; fi
             ;;
         *)
-            if [[ -z ${pem_file-} ]]; then
-                pem_file="$1"
-                shift
-            else
-                clear
-                logE "Invalid input. Refer to the usage instructions"
-                help
-            fi
-            ;;
+            [[ -z "$pem_file" ]] || { print -u2 -- "Only one PEM file may be supplied."; return 2 2>/dev/null || exit 2; }
+            pem_file="$1"; shift ;;
     esac
 done
 
-###############################   RUNTIME   ################################
-if [[ -z "${invoked-}" ]]; then clear; fi
-echo; logI "  ---   ${PINK}SCRIPT: $current_dir/$scriptname${NC}   ---"
-logI "        ${PINK}     The purpose of this script is to scan a PEM Certificate Store to ensure its integrity...${NC}"
-
-# If not invoked/sourced by another script, we'll set some variables for standalone use...
-if [[ -z "${invoked-}" ]]; then
-    echo -e "Summary: This script checks the integrity of PEM files containing certificates by parsing them and validating each certificate using OpenSSL.
-         It reads the PEM file, lists the certificates, and verifies each one. If any certificate is invalid, it logs an error. The script shows a
-         progress bar as it processes the certificates. Additionally, it provides an option to input the PEM file path if not specified."
-    echo -e "Author:  contact@photonsec.com.au\t\tgithub.com/Enelass\n"
-    logonly "This script was executed directly and not sourced from another script..."
-fi
-
-if [[ -z ${pem_file-} ]]; then
-    logI "Please input our certificate store (pem file) full path:"
-    read "pem_file"
+if [[ -z "$pem_file" ]]; then
+    if (( standalone )) && [[ -t 0 ]]; then
+        print -n -- "PEM file to inspect: "
+        read -r pem_file
+    else
+        logW "A PEM file is required."
+        return 2 2>/dev/null || exit 2
+    fi
 fi
 
 if [[ ! -f "$pem_file" ]]; then
-    logE "File \"$pem_file\" not found!"
-    if [[ -n ${invoked-} ]]; then
-        return 1
-    else
-        exit 1
-    fi
+    logW "File '$pem_file' was not found."
+    if (( standalone )); then exit 1; else return 1; fi
 fi
-
-cert_count1=$(grep -c -- '-----BEGIN CERTIFICATE-----' "$pem_file")
-cert_count2=$(grep -c -- '-----END CERTIFICATE-----' "$pem_file")
-
-if [[ $cert_count1 -eq 0 ]]; then
-    pem_error=true
-    logE "There are no Base64 certificates in this file."
-    if [[ -n ${invoked-} ]]; then
-        return 1
-    else
-        exit 1
-    fi
+if [[ ! -r "$exclusion_file" ]]; then
+    logW "CA exclusion policy '$exclusion_file' is not readable; validation cannot continue safely."
+    if (( standalone )); then exit 1; else return 1; fi
 fi
+(( quiet )) || {
+    print
+    logI "--- SCRIPT: $current_dir/$scriptname ---"
+    logI "Validating root CA structure, dates, trust and local exclusion policy."
+}
 
-if [[ $cert_count1 -ne $cert_count2 ]]; then
-    pem_error=true
-    logW "Certificate boundaries are not set properly."
-fi
-
-# First, detect and remove duplicate certificate blocks from the PEM file
-dedupe_pem_file "$pem_file"
-
-# Time to process that good-looking pem file...
 pem_integrity_check "$pem_file"
-
-if [[ "${pem_error-}" == "true" ]]; then
-    if [[ -n ${cert_error-} ]]; then
-        logW "This pem file is corrupted or contains corrupted Base 64 entries (certificates)"
-        logW "Erroneous certificate numbers: $cert_error"
-    fi
-    if [[ -n ${invoked-} ]]; then
-        return 1
-    else
-        exit 1
-    fi
-else
-    logS "No issue within this Certificate Store"
-fi
-
-if [[ ${verbose:-0} -eq 1 ]]; then echo -e "$cert_CNs"; fi
-if [[ -n $silent || -n $quiet ]]; then unquiet; fi
+local result=$?
+if (( standalone )); then exit "$result"; else return "$result"; fi

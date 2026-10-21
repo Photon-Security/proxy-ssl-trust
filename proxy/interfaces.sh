@@ -8,27 +8,35 @@ if [[ -z ${logI-} ]]; then source "$current_dir/../lib/stderr_stdout_syntax.sh";
 
 # Function to get and process HTTP proxy settings for a given network service
 get_proxy_settings() {
-    local service=$1; local webproxy_settings securewebproxy_settings autoproxy_settings
+    local service=$1
+    local webproxy_settings securewebproxy_settings autoproxy_settings
+    local proxy_server proxy_port pac_url_for_service
     logI "    Proxy settings for $service"
+
     # Fetch web proxy settings
     webproxy_settings=$(networksetup -getwebproxy "${service}")
     if echo "$webproxy_settings" | grep -q "Enabled: Yes"; then
-        logI "    getwebproxy $webproxy_settings" | grep -v "Enabled"
+        proxy_server=$(print -r -- "$webproxy_settings" | awk -F': ' '/^Server:/{print $2}')
+        proxy_port=$(print -r -- "$webproxy_settings" | awk -F': ' '/^Port:/{print $2}')
+        logI "      HTTP proxy enabled: ${proxy_server:-unknown}:${proxy_port:-unknown}"
     else unset webproxy_settings
     fi
 
     # Fetch secure web proxy settings
     securewebproxy_settings=$(networksetup -getsecurewebproxy "${service}")
     if echo "$securewebproxy_settings" | grep -q "Enabled: Yes"; then
-        logI "getsecurewebproxy $securewebproxy_settings" | grep -v "Enabled"
+        proxy_server=$(print -r -- "$securewebproxy_settings" | awk -F': ' '/^Server:/{print $2}')
+        proxy_port=$(print -r -- "$securewebproxy_settings" | awk -F': ' '/^Port:/{print $2}')
+        logI "      HTTPS proxy enabled: ${proxy_server:-unknown}:${proxy_port:-unknown}"
     else unset securewebproxy_settings
     fi
 
     # Fetch auto proxy settings
     autoproxy_settings=$(networksetup -getautoproxyurl "${service}")
     if echo "$autoproxy_settings" | grep -q "Enabled: Yes"; then
-        pac_urls+=($(echo "$autoproxy_settings" | grep -E "^URL: " | awk '{print $2}'))
-        logI "     getautoproxy $autoproxy_settings" | grep "URL: "
+        pac_url_for_service=$(print -r -- "$autoproxy_settings" | awk -F': ' '/^URL:/{print $2}')
+        [[ -n "$pac_url_for_service" ]] && pac_urls+=("$pac_url_for_service")
+        logI "      Auto proxy URL enabled: ${pac_url_for_service:-unknown}"
     else unset autoproxy_settings
     fi
 
@@ -55,7 +63,6 @@ while IFS= read -r service; do
     else
         logW "   $service is inactive, it doesn't have an IP address or a valid one..."
         get_proxy_settings "${service}"
-        echo -en "\r\033[2K\033[F\033[2K\033[F\033[2K\033[F\033[2K"
     fi
     
 done <<< "$interfaces"

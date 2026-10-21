@@ -2,73 +2,69 @@
 
 ## Description
 
-This script checks the integrity of PEM files containing certificates by parsing them and validating each certificate using OpenSSL. It reads the provided PEM file, lists the certificates, and verifies each one. If any certificate is invalid, it logs an error. The script displays a progress bar as it processes the certificates.
+`PEM_Check.sh` validates a PEM root CA bundle and identifies certificates that
+should not remain trusted. It checks certificate parsing, validity dates, root
+and signing-CA constraints, self-signatures, duplicates, macOS trust, and the
+repository's explicit CA exclusion policy.
+
+Every retained certificate must be trusted as a root CA by the current macOS
+Keychain settings and must not match the explicit exclusion policy. A missing
+or unreadable exclusion policy causes validation to fail closed.
+
+When run directly, the script lists each certificate and its removal reason,
+then requires confirmation before changing the file. When sourced by the bundle
+builder, remediation is automatic. The original file is not changed when its
+PEM boundaries are malformed or when cleanup would leave an empty trust store.
 
 ## Requirements
 
-- MacOS with Zsh shell (tested on MacOS 15)
-- Bundled Shell scripts from the lib folders
-
-## Getting Started
-
-To use this script, download or clone this repository by running the following command:
-
-```zsh
-/bin/zsh -c "$(curl -fsSL https://raw.githubusercontent.com/Enelass/proxy-ssl-trust/refs/heads/main/lib/download_run_me.sh)" -- --downloadonly
-```
+- macOS with Zsh
+- OpenSSL
+- The bundled logging helpers in `lib/`
 
 ## Usage
-Navigate to the directory containing the script and run:
 
 ```zsh
-cd ~/Applications/proxy-ssl-trust/SSL
-./PEM_Check.sh [OPTIONS]
-
-
-Usage: PEM_Check.sh [options] [pem_file_path]
+./SSL/PEM_Check.sh [OPTIONS] [PEM_FILE]
 
 Options:
-    --help, -h       Show this help message and exit.
-    --quiet, -q      Suppress the output except for error status.
-    --verbose        Shows the verbose for each certificate subject and name
-
-Example Usage:
-    PEM_Check.sh --path /path/to/certificate.pem     # Validates certificates in the specified PEM file.
-    PEM_Check.sh --verbose --path /path/to/crt.pem   # Validates and display certificates subjects from the specified PEM file
-    PEM_Check.sh -q -p /path/to/certificate.pem      # Validates certificates quietly and saves status in pem_error variable
-    PEM_Check.sh                                     # Prompts for PEM file path interactively.
+  --cafile, -c, -f PATH       PEM bundle to inspect
+  --exclusions PATH           Alternative CA exclusion policy
+  --audit                     Report issues without changing the file
+  --verbose, -v               List retained certificate subjects
+  --quiet, -q                 Suppress progress and success messages
+  --help, -h                  Show help
 ```
-![alt text](PEM_Check_help.png)
 
+Examples:
 
-## Description
+```zsh
+# Inspect and offer to remove unsafe certificates
+./SSL/PEM_Check.sh --cafile /path/to/cacert.pem
 
-The script performs the following tasks:
+# CI/read-only inspection
+./SSL/PEM_Check.sh --audit --cafile /path/to/cacert.pem
 
-1. Reads the provided PEM file and checks if it contains any certificates.
-2. Parses the PEM file and extracts all the certificates.
-3. Validates each certificate using OpenSSL.
-4. Displays a progress bar as it processes the certificates.
-5. Logs any issues found with the certificates.
-6. Provides an option to display the subjects of the certificates (if the `--verbose` option is used).
+```
 
-## Example Output
+## Exclusion policy
 
-Success - This certificate store is valid and contains no eroneous Base 64 certificate
-![Success gif](PEM_Check_Success.gif)
+The default policy is `SSL/ca_exclusions.conf`. Its pipe-delimited format is:
 
-Failure - Not a PEM File containing Base 64 certificates
-![Failure png](PEM_Check_Failure.png)
+```text
+match_type|SHA-256 value|display name|reason
+```
 
-Failure - Valid PEM file but containing corrupted Certificate entries
-![Failure gif](PEM_Check_Failure.gif)
+Supported match types are `cert_sha256` and `spki_sha256`. SPKI hashes are
+preferred because the same public key remains blocked if its certificate is
+reissued or cross-signed.
 
-## Requirements
-
-- The script requires the `openssl` command-line tool to be installed on the system.
-- The script is written in Zsh and may not work with other shell environments without modifications.
+Root trust anchors normally cannot be usefully checked through their own OCSP
+or CRL fields. Revoked or incident-affected CA hierarchies therefore belong in
+this explicit policy, while macOS trust evaluation supplies current host-level
+trust and distrust decisions.
 
 ## Author
 
-- Florian (contact@photonsec.com.au)
+- Florian Bidabe (contact@photonsec.com.au)
 - GitHub: https://github.com/Enelass

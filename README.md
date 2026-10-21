@@ -104,4 +104,27 @@ The following command will download the suite of tools to `~/Applications/proxy-
 
 Log files are created in `/tmp` directory with the name `Proxy_SSL_Trust.log`.
 
+## Certificate bundle safety
+
+`SSL/PEM_Var.sh` rebuilds the custom bundle from the current curl/Mozilla CA
+bundle on every run, then adds only root signing CAs which macOS currently
+trusts. The completed bundle is checked for malformed, expired, not-yet-valid,
+non-root, non-signing, duplicate, untrusted, and locally excluded certificates
+before it replaces the previous bundle.
+
+Local distrust decisions are maintained in `SSL/ca_exclusions.conf`. Entries
+use a certificate or, preferably, SPKI SHA-256 hash so a renamed or cross-signed
+copy cannot bypass the exclusion. The default policy excludes `emSign Root TLS
+CA - G3`, `emSign Root CS CA - G3`, and their cross-signing trust anchor
+`emSign ECC Root CA - G3` because subordinate CA private keys were compromised
+and many non-browser TLS clients do not enforce revocation.
+
+Run the checker directly to review an existing bundle. It explains every
+proposed removal and asks for confirmation before modifying the file:
+
+```zsh
+./SSL/PEM_Check.sh --cafile /path/to/cacert.pem
+./SSL/PEM_Check.sh --audit --cafile /path/to/cacert.pem
+```
+
 ![alt text](assets/Banner-minimalist.png)
